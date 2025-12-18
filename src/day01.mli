@@ -21,7 +21,11 @@ module I : sig
 end
 
 module O : sig
-  type 'a t = { answer : 'a With_valid.t } [@@deriving hardcaml]
+  type 'a t =
+    { answer1 : 'a With_valid.t
+    ; answer2 : 'a With_valid.t
+    }
+  [@@deriving hardcaml]
 end
 
 val hierarchical : Scope.t -> Signal.t I.t -> Signal.t O.t
