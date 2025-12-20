@@ -10,7 +10,7 @@ module I = struct
     ; clear : 'a
     ; start : 'a
     ; finish : 'a
-    ; data_in : 'a [@bits num_bits]
+    ; data_in : 'a [@bits 8]
     ; data_in_valid : 'a
     }
   [@@deriving hardcaml]
@@ -44,6 +44,7 @@ let create scope ({ clock; clear; start; finish; data_in; data_in_valid } : _ I.
   let%hw_var sum = Variable.reg spec ~width:num_bits in
   let%hw_var max_joltage = Variable.reg spec ~width:num_bits in
   let%hw_var joltage = Variable.wire ~default:(zero num_bits) () in
+  let%hw_var digit = Variable.wire ~default:(zero num_bits) () in
   let%hw_var max_digit = Variable.reg spec ~width:num_bits in
 
   (* RAM *)
@@ -94,7 +95,7 @@ let create scope ({ clock; clear; start; finish; data_in; data_in_valid } : _ I.
           , [ when_ data_in_valid
               [ if_ (wr_addr.value ==:. 65535)
                   [ sm.set_next Looping ]
-                  [ wr_data <-- data_in
+                  [ wr_data <-- uresize ~width:16 data_in
                   ; wr_enable <-- vdd
                   ; wr_addr <-- wr_addr.value +:. 1
                   ]
@@ -104,18 +105,22 @@ let create scope ({ clock; clear; start; finish; data_in; data_in_valid } : _ I.
         ; ( Looping
           , [ if_ (rd_addr.value >: wr_addr.value) [ sm.set_next Done ]
                 (* Read next input from RAM *)
-                [ joltage <-- (uresize ~width:num_bits (max_digit.value *: (of_string "4'd10"))) +: mem.(0)
-                ; when_ (joltage.value >: max_joltage.value) [ max_joltage <-- joltage.value ]
-                ; when_ (max_digit.value <: mem.(0)) [ max_digit <-- mem.(0) ]
-
+                [ if_ (mem.(0) ==:. Char.to_int '\n')
+                    [ sum <-- sum.value +: max_joltage.value ; max_joltage <--. 0 ; max_digit <--. 0 ]
+                @@ elif (mem.(0) ==:. 0) []
+                @@  [ digit <-- mem.(0) -:. Char.to_int '0'
+                    ; joltage <-- (uresize ~width:num_bits (max_digit.value *: (of_string "4'd10"))) +: digit.value
+                    ; when_ (joltage.value >: max_joltage.value) [ max_joltage <-- joltage.value ]
+                    ; when_ (max_digit.value <: digit.value) [ max_digit <-- digit.value ]
+                    ]
                 ; rd_enable <-- vdd
                 ; rd_addr <-- rd_addr.value +:. 1
                 ]
             ] )
         ; ( Done
-          , [ answer1 <-- max_joltage.value
+          , [ answer1 <-- sum.value
             ; answer1_valid <-- vdd
-            ; answer2 <--. 0
+            ; answer2 <-- sum.value
             ; answer2_valid <-- vdd
             ; when_ finish [ sm.set_next Accepting_inputs ]
             ] )
