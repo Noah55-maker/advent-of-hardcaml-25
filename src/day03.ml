@@ -2,7 +2,9 @@ open! Core
 open! Hardcaml
 open! Signal
 
-let num_bits = 16
+let num_bits = 64 (* integer size for calculations *)
+let addr_bits = 8 (* RAM size will be 2^(addr_bits) *)
+let fifo_depth = 65536
 
 module I = struct
   type 'a t =
@@ -28,7 +30,10 @@ module States = struct
   type t =
     | Idle
     | Accepting_inputs
-    | Looping
+    | Part2_setup
+    | Part2_read
+    | Part2_write
+    | Read_stack
     | Done
   [@@deriving sexp_of, compare ~localize, enumerate]
 end
@@ -42,22 +47,42 @@ let create scope ({ clock; clear; start; finish; data_in; data_in_valid } : _ I.
   in
 
   let%hw_var sum = Variable.reg spec ~width:num_bits in
+  let%hw_var sum2 = Variable.reg spec ~width:num_bits in
   let%hw_var max_joltage = Variable.reg spec ~width:num_bits in
   let%hw_var joltage = Variable.wire ~default:(zero num_bits) () in
-  let%hw_var digit = Variable.wire ~default:(zero num_bits) () in
   let%hw_var max_digit = Variable.reg spec ~width:num_bits in
 
+  (* FIFO *)
+  let%hw_var fifo_rd = Variable.wire ~default:gnd () in
+  let%tydi { q = fifo_front; full = fifo_full; empty = fifo_empty; _ } =
+    Fifo.create
+      ~showahead:true
+      ~scope:(Scope.sub_scope scope "fifo")
+      ~capacity:fifo_depth
+      ~overflow_check:true
+      ~underflow_check:true
+      ~clock
+      ~clear
+      ~wr:data_in_valid
+      ~d:data_in
+      ~rd:fifo_rd.value
+      ()
+  in
+  let%hw fifo_full in
+  let%hw fifo_empty in
+  let%hw fifo_front in
+
   (* RAM *)
-  let%hw_var rd_addr = Variable.reg spec ~width:num_bits in
+  let%hw_var rd_addr = Variable.reg spec ~width:addr_bits in
   let%hw_var rd_enable = Variable.wire ~default:gnd () in
 
-  let%hw_var wr_addr = Variable.reg spec ~width:num_bits in
+  let%hw_var wr_addr = Variable.reg spec ~width:addr_bits in
   let%hw_var wr_enable = Variable.wire ~default:gnd () in
   let%hw_var wr_data = Variable.wire ~default:(zero num_bits) () in
   let mem =
     Hardcaml.Ram.create
       ~collision_mode:Read_before_write
-      ~size:65536
+      ~size:(Int.pow 2 addr_bits)
       ~write_ports:
         [| { write_clock = clock
             ; write_address = wr_addr.value
@@ -84,43 +109,57 @@ let create scope ({ clock; clear; start; finish; data_in; data_in_valid } : _ I.
           , [ when_
                 start
                 [ sum <-- zero num_bits
+                ; sum2 <--. 0
                 ; max_joltage <-- zero num_bits
                 ; joltage <-- zero num_bits
                 ; max_digit <-- zero num_bits
-                ; sm.set_next Accepting_inputs
                 ; wr_addr <--. 0
+                ; sm.set_next Accepting_inputs
                 ]
             ] )
         ; ( Accepting_inputs
           , [ when_ data_in_valid
-              [ if_ (wr_addr.value ==:. 65535)
-                  [ sm.set_next Looping ]
-                  [ wr_data <-- uresize ~width:16 data_in
-                  ; wr_enable <-- vdd
-                  ; wr_addr <-- wr_addr.value +:. 1
-                  ]
-              ]
-            ; when_ finish [ sm.set_next Looping ]
+              [ when_ fifo_full [ sm.set_next Part2_setup ] ]
+            ; when_ finish [ sm.set_next Part2_setup ]
             ] )
-        ; ( Looping
-          , [ if_ (rd_addr.value >: wr_addr.value) [ sm.set_next Done ]
-                (* Read next input from RAM *)
-                [ if_ (mem.(0) ==:. Char.to_int '\n')
-                    [ sum <-- sum.value +: max_joltage.value ; max_joltage <--. 0 ; max_digit <--. 0 ]
-                @@ elif (mem.(0) ==:. 0) []
-                @@  [ digit <-- mem.(0) -:. Char.to_int '0'
-                    ; joltage <-- (uresize ~width:num_bits (max_digit.value *: (of_string "4'd10"))) +: digit.value
-                    ; when_ (joltage.value >: max_joltage.value) [ max_joltage <-- joltage.value ]
-                    ; when_ (max_digit.value <: digit.value) [ max_digit <-- digit.value ]
-                    ]
-                ; rd_enable <-- vdd
-                ; rd_addr <-- rd_addr.value +:. 1
+        ; ( Part2_setup
+            , [ rd_addr <-- ones addr_bits
+              ; wr_addr <-- ones addr_bits
+              ; sm.set_next Part2_read
+            ] )
+        ; ( Part2_read
+            , [ if_     (fifo_empty |: (fifo_front ==:. 0)) [ sm.set_next Done ]
+                @@ elif (fifo_front ==:. Char.to_int '\n') (* Next line *)
+                        [ sm.set_next Read_stack
+                        ; rd_addr <--. 0
+                        ; rd_enable <-- vdd
+                        ; max_joltage <--. 0
+                        ; fifo_rd <-- vdd
+                        ]
+                @@      [ rd_enable <-- vdd
+                        ; rd_addr <-- rd_addr.value +:. 1
+                        ; wr_addr <-- wr_addr.value +:. 1
+                        ; sm.set_next Part2_write
+                        ]
+            ] )
+        ; ( Part2_write
+            , [ when_ (rd_addr.value <=+. 12)
+                [ wr_data <-- uresize ~width:num_bits fifo_front -:. Char.to_int '0'
+                ; wr_enable <-- vdd
                 ]
+              ; fifo_rd <-- vdd
+              ; sm.set_next Part2_read
+            ] )
+        ; ( Read_stack
+            , [ max_joltage <-- uresize ~width:num_bits (max_joltage.value *: of_string "4'd10") +: mem.(0)
+              ; when_ (rd_addr.value >+. 12) [ sum2 <-- sum2.value +: max_joltage.value ; sm.set_next Part2_setup ]
+              ; rd_addr <-- rd_addr.value +:. 1
+              ; rd_enable <-- vdd
             ] )
         ; ( Done
-          , [ answer1 <-- sum.value
+          , [ answer1 <--. 0
             ; answer1_valid <-- vdd
-            ; answer2 <-- sum.value
+            ; answer2 <-- sum2.value
             ; answer2_valid <-- vdd
             ; when_ finish [ sm.set_next Accepting_inputs ]
             ] )
